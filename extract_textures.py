@@ -1,12 +1,12 @@
 """Extract image textures from .blend files into per-asset folders.
 
 Usage:
-    blender -b --python extract_blend_textures.py -- \
+    blender -b --python extract_textures.py -- \
         --blend_dir /path/to/blends \
         --out_dir /path/to/animal_textures
 
 Or specify individual files:
-    blender -b --python extract_blend_textures.py -- \
+    blender -b --python extract_textures.py -- \
         --blend_files fur1.blend fur2.blend ... \
         --out_dir ./animal_textures
 """

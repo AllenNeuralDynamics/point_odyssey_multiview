@@ -223,7 +223,7 @@ results/
 *.log
 # cluster-specific launch scripts (local paths / Slurm settings)
 cluster_scripts/
-# experimental per-view parallel rendering (not used for the released data)
+# experimental per-view parallel rendering
 render_human_parallel.py
 render_view.py
 export_annotation_human_parallel.py

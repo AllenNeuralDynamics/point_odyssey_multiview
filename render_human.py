@@ -512,6 +512,7 @@ class Blender_render():
         # This function is derived from Kubric. 
         
         # Copyright 2024 The Kubric Authors.
+        # Modified for multi-view rendering in point_odyssey_multiview; changes are described in NOTICE.md.
         #
         # Licensed under the Apache License, Version 2.0 (the "License");
         # you may not use this file except in compliance with the License.
