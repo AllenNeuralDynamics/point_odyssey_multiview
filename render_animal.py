@@ -18,7 +18,7 @@ RESULOUTION_X = 960
 RESULOUTION_Y = 540
 
 # randomize np seed using time
-np.random.seed(int(time.time()))
+# np.random.seed(int(time.time()))
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -192,6 +192,7 @@ class Blender_render():
                  partnet_path=None,
                  GSO_path=None,
                  animal_path=None,
+                 animal_texture_path=None,
                  animal_name=None,
                  material_path=None,
                  camera_path=None,
@@ -204,12 +205,14 @@ class Blender_render():
                  custom_scene=None,
                  use_gpu: bool = False,
                  use_indoor_cam: bool = False,
+                 use_static_cam: bool = False,
                  add_force: bool = False,
                  add_smoke: bool = False,
                  force_step: int = 3,
                  force_num: int = 3,
                  force_interval: int = 200,
                  views=1,
+                 max_frames=None
                  ):
         self.blender_scene = bpy.context.scene
         self.render_engine = render_engine
@@ -224,11 +227,13 @@ class Blender_render():
         self.GSO_path = GSO_path
         self.partnet_path = partnet_path
         self.animal_path = animal_path
+        self.animal_texture_path = animal_texture_path
         self.animal_name = animal_name
         self.material_path = material_path
 
         self.GSO_path = GSO_path
         self.camera_path = camera_path
+        self.use_static_cam = use_static_cam
 
         self.force_step = force_step
         self.force_num = force_num
@@ -256,6 +261,7 @@ class Blender_render():
 
         self.exr_output_node = self.set_up_exr_output_node()
         self.views = views
+        self.max_frames = max_frames
 
         # self.blender_scene.render.resolution_percentage = 100
         if background_hdr_path:
@@ -293,7 +299,9 @@ class Blender_render():
 
             bpy.context.preferences.addons["cycles"].preferences.get_devices()
             for d in bpy.context.preferences.addons["cycles"].preferences.devices:
-                d.use = True
+                # GPU-only: enable CUDA GPU devices, disable the CPU device so
+                # Cycles doesn't hybrid-render on CPU (which oversubscribes cores).
+                d.use = (d.type == 'CUDA')
                 print("Device '{}' type {} : {}".format(d.name, d.type, d.use))
             print('setting up gpu done')
             print("----------------------------------------------")
@@ -395,14 +403,19 @@ class Blender_render():
                 aux_view_layer.cycles.pass_crypto_depth = 2
 
     def load_assets(self):
+
         # load animal
         animal_list = os.listdir(self.animal_path)
+        animals_to_exclude = {'dragonOF2'} 
+        animal_list = [a for a in animal_list if a.split('_')[0] not in animals_to_exclude]
+
         if self.animal_name is None:
             animal = np.random.choice(animal_list)
             self.animal_name = animal.split('_')[0]
-        animal_list = [c for c in animal_list if self.animal_name in c]
-        # sort animal_list by file size
 
+        animal_list = [c for c in animal_list if self.animal_name in c]
+        
+        # sort animal_list by file size
         animal_list = sorted(animal_list, key=lambda x: os.path.getsize(os.path.join(self.animal_path, x)))[:50]
         print(animal_list, self.animal_name)
         animal_list = np.random.choice(animal_list, 30, replace=False if len(animal_list) > 30 else True)
@@ -435,18 +448,38 @@ class Blender_render():
         bpy.ops.object.transform_apply(location=True, rotation=False, scale=False)
 
         # add random texture to animal
+        # print('adding texture')
+        # # append materials
+        # bpy.ops.wm.append(
+        #     directory=os.path.join(self.material_path, "Object"),
+        #     filename="Cube"
+        # )
+
+        # furry_material = [f for f in bpy.data.materials if 'Fur' in f.name] # previously 'Animal'
+        # furry_material = np.random.choice(furry_material)
+        # print('furry material', furry_material)
+
+        # self.animal.data.materials.clear()
+        # self.animal.data.materials.append(furry_material)
+
+        # add random fur texture to animal
         print('adding texture')
-        # append materials
-        bpy.ops.wm.append(
-            directory=os.path.join(self.material_path, "Object"),
-            filename="Cube"
-        )
 
-        furry_material = [f for f in bpy.data.materials if 'Animal' in f.name]
-        furry_material = np.random.choice(furry_material)
-
-        self.animal.data.materials.clear()
-        self.animal.data.materials.append(furry_material)
+        if self.apply_animal_fur_texture(self.animal):
+            pass  # success, fur applied from animal_texture_root
+        else:
+            # fall back to the old fur-material .blend approach
+            print('falling back to fur material from .blend')
+            bpy.ops.wm.append(
+                directory=os.path.join(self.material_path, "Object"),
+                filename="Cube"
+            )
+            furry_material = [f for f in bpy.data.materials if 'Fur' in f.name]
+            if furry_material:
+                furry_material = np.random.choice(furry_material)
+                print('furry material', furry_material)
+                self.animal.data.materials.clear()
+                self.animal.data.materials.append(furry_material)
 
         # add physics
         bpy.context.view_layer.objects.active = self.animal
@@ -488,7 +521,7 @@ class Blender_render():
 
         partnet_assets = os.listdir(self.partnet_path)
         partnet_assets = [os.path.join(self.partnet_path, asset) for asset in partnet_assets]
-        partnet_assets = [asset for asset in partnet_assets if os.path.isdir(asset) and len(os.listdir(os.path.join(asset, 'objs'))) < 15]
+        partnet_assets = [asset for asset in partnet_assets if os.path.isdir(asset) and not os.path.basename(asset).startswith('.') and len(os.listdir(os.path.join(asset, 'objs'))) < 15]
         partnet_assets = np.random.choice(partnet_assets, size=self.num_assets - len(GSO_assets_path), replace=False)
 
         # generating location lists for assets, and remove the center area
@@ -661,7 +694,124 @@ class Blender_render():
         # assign to 1st material slot
         obj.data.materials.append(mat)
 
+    def apply_animal_fur_texture(self, obj):
+        """Pick a random fur folder and build a material from its color/normal/
+        roughness/displacement PNGs. Returns True if successful, False otherwise.
+
+        Expects per-fur folder structure:
+            animal_texture_root/<fur_name>/{color,normal,roughness,displacement}*.png
+        Substring-matches filenames so it tolerates suffixes like 'color_4k.png'.
+        """
+        if not self.animal_texture_path or not os.path.isdir(self.animal_texture_path):
+            return False
+
+        fur_dirs = [
+            d for d in os.listdir(self.animal_texture_path)
+            if os.path.isdir(os.path.join(self.animal_texture_path, d))
+        ]
+        if not fur_dirs:
+            return False
+
+        chosen = np.random.choice(fur_dirs)
+        print(chosen)
+        fur_path = os.path.join(self.animal_texture_path, chosen)
+        files = os.listdir(fur_path)
+
+        def find(*keywords):
+            for f in sorted(files):
+                fl = f.lower()
+                if any(kw in fl for kw in keywords):
+                    return os.path.join(fur_path, f)
+            return None
+
+        color_path = find('color', 'diffuse', 'albedo', 'basecolor')
+        normal_path = find('normal', 'norm')
+        rough_path = find('rough')
+        disp_path = find('displ', 'height')
+
+        if color_path is None:
+            print(f'[fur] no color map in {chosen}, skipping')
+            return False
+
+        print(f'[fur] using "{chosen}": '
+            f'color={bool(color_path)}, normal={bool(normal_path)}, '
+            f'rough={bool(rough_path)}, disp={bool(disp_path)}')
+
+        # Build the material
+        mat = bpy.data.materials.new(name=f'animal_fur_{chosen}')
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+
+        bsdf = nodes['Principled BSDF']
+        output = nodes['Material Output']
+
+        # Tex coordinates + mapping (smart_project islands tend to be small,
+        # so randomize scale for variety across animals)
+        tex_coord = nodes.new('ShaderNodeTexCoord')
+        mapping = nodes.new('ShaderNodeMapping')
+        scale = float(np.random.uniform(0.5, 3.0))
+        mapping.inputs['Scale'].default_value = (scale, scale, scale)
+        links.new(tex_coord.outputs['UV'], mapping.inputs['Vector'])
+
+        def add_image(path, color_space='sRGB'):
+            n = nodes.new('ShaderNodeTexImage')
+            n.image = bpy.data.images.load(path)
+            n.image.colorspace_settings.name = color_space
+            links.new(mapping.outputs['Vector'], n.inputs['Vector'])
+            return n
+
+        # Color → Base Color
+        color_node = add_image(color_path, 'sRGB')
+        links.new(color_node.outputs['Color'], bsdf.inputs['Base Color'])
+
+        # Normal → Normal Map → BSDF Normal
+        if normal_path:
+            normal_node = add_image(normal_path, 'Non-Color')
+            nm = nodes.new('ShaderNodeNormalMap')
+            links.new(normal_node.outputs['Color'], nm.inputs['Color'])
+            links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
+
+        # Roughness → BSDF Roughness
+        if rough_path:
+            rough_node = add_image(rough_path, 'Non-Color')
+            links.new(rough_node.outputs['Color'], bsdf.inputs['Roughness'])
+        else:
+            bsdf.inputs['Roughness'].default_value = 0.85  # furry-looking default
+
+        # Displacement → Displacement node → Material Output Displacement
+        if disp_path:
+            disp_node = add_image(disp_path, 'Non-Color')
+            disp = nodes.new('ShaderNodeDisplacement')
+            disp.inputs['Scale'].default_value = 0.05  # subtle, prevents weirdness
+            links.new(disp_node.outputs['Color'], disp.inputs['Height'])
+            links.new(disp.outputs['Displacement'], output.inputs['Displacement'])
+
+        # Apply to object
+        obj.data.materials.clear()
+        obj.data.materials.append(mat)
+        return True
+
     def set_up_exr_output_node(self):
+        ''' 
+        # This function is derived from Kubric. 
+        
+        # Copyright 2024 The Kubric Authors.
+        #
+        # Licensed under the Apache License, Version 2.0 (the "License");
+        # you may not use this file except in compliance with the License.
+        # You may obtain a copy of the License at
+        #
+        #     http://www.apache.org/licenses/LICENSE-2.0
+        #
+        # Unless required by applicable law or agreed to in writing, software
+        # distributed under the License is distributed on an "AS IS" BASIS,
+        # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        # See the License for the specific language governing permissions and
+        # limitations under the License.
+
+        Modifications made by the PointOdyssey Authors (https://github.com/y-zheng18/point_odyssey/tree/main).
+        '''
         bpy.context.scene.use_nodes = True
         tree = bpy.context.scene.node_tree
         links = tree.links
@@ -847,11 +997,17 @@ class Blender_render():
             delta_T *= self.scale_factor
             print('delta_T', delta_T)
             # delta_T = np.clip(delta_T, -0.2 * 1 / time_ratio * self.scale_factor, 0.2 * 1 / time_ratio * self.scale_factor).reshape(3)
-            mean_location = np.mean([obj.matrix_world.translation for obj in self.assets_set if
-                                     np.max(np.abs(obj.matrix_world.translation)) < 3 * self.scale_factor], axis=0)
-
-            # mean_location[:2] *= 0
-            self.cam_lookat = self.cam_lookat * 0.95 + mathutils.Vector(mean_location) * 0.05
+            near_assets = [obj.matrix_world.translation for obj in self.assets_set
+                           if np.max(np.abs(obj.matrix_world.translation)) < 3 * self.scale_factor]
+            # When forces fling every asset out of range this frame, the list is
+            # empty and np.mean([], axis=0) returns a nan scalar, which makes
+            # mathutils.Vector() raise TypeError and aborts the whole render
+            # before any frame is written. In that case keep the previous
+            # look-at target instead of crashing.
+            if near_assets:
+                mean_location = np.mean(near_assets, axis=0)
+                # mean_location[:2] *= 0
+                self.cam_lookat = self.cam_lookat * 0.95 + mathutils.Vector(mean_location) * 0.05
 
             self.cam_loc = self.cam_loc + mathutils.Vector([delta_T[0], delta_T[1], delta_T[2]])
             if np.linalg.norm(np.array(self.cam_loc[:2])) < initial_r * 0.75:
@@ -893,9 +1049,13 @@ class Blender_render():
                       'assets': ['background']}
         scene_info['assets'] += [x.data.name for x in self.assets_set]
         scene_info['character'] = self.animal.name
+        scene_info['character_meshes'] = [self.animal.data.name] # TODO new
         json.dump(scene_info, open(os.path.join(self.scratch_dir, 'scene_info.json'), 'w'))
 
-        frames = range(bpy.context.scene.frame_start, bpy.context.scene.frame_end + 1)
+        frame_end = (bpy.context.scene.frame_start + self.max_frames - 1
+             if self.max_frames is not None
+             else bpy.context.scene.frame_end)
+        frames = range(bpy.context.scene.frame_start, frame_end + 1)
 
         # add forces
         for frame_nr in frames:
@@ -946,10 +1106,11 @@ class Blender_render():
             camera_files = glob.glob(os.path.join(self.camera_path, '*/*.txt'))
             # filter out small files
             camera_files = [c for c in camera_files if os.path.getsize(c) > 5000]
-            camera_file = np.random.choice(camera_files)
-            print('camera file: ', camera_file)
-            camera_rt = np.loadtxt(camera_file, skiprows=1)[:, 7:].reshape(-1, 3, 4)
-            self.bake_camera(camera_rt, frames)
+
+            if not self.use_static_cam:
+                camera_file = np.random.choice(camera_files)
+                camera_rt = np.loadtxt(camera_file, skiprows=1)[:, 7:].reshape(-1, 3, 4)
+                self.bake_camera(camera_rt, frames)
 
             bpy.ops.wm.save_as_mainfile(filepath=os.path.join(absolute_path, 'scene.blend'))
             for frame_nr in frames:
@@ -993,9 +1154,10 @@ class Blender_render():
                 self.camera.data.clip_end = 10000
                 self.camera.data.sensor_width = SENSOR_WIDTH
 
-                camera_file = camera_files[i]
-                camera_rt = np.loadtxt(camera_file, skiprows=1)[:, 7:].reshape(-1, 3, 4)
-                self.bake_camera(camera_rt, frames)
+                if not self.use_static_cam:
+                    camera_file = camera_files[i]
+                    camera_rt = np.loadtxt(camera_file, skiprows=1)[:, 7:].reshape(-1, 3, 4)
+                    self.bake_camera(camera_rt, frames)
 
             bpy.ops.wm.save_as_mainfile(filepath=os.path.join(absolute_path, 'scene.blend'))
             for frame_nr in frames:
@@ -1089,6 +1251,7 @@ if __name__ == "__main__":
                         help='path to specific folder which include folders containing .obj files',
                         default='/Users/yangzheng/Documents/Blender/Assets/materials')
     parser.add_argument('--animal_root', type=str, metavar='PATH', default='./data/deformingthings4d')
+    parser.add_argument('--animal_texture_root', type=str, metavar='PATH', default='./data/animal_textures')
     parser.add_argument('--animal_name', type=str, metavar='PATH', default=None)
     parser.add_argument('--camera_root', type=str, metavar='PATH', default='./data/camera_trajectory/MannequinChallenge')
     parser.add_argument('--partnet_root', type=str, metavar='PATH', default='./data/partnet/')
@@ -1102,6 +1265,7 @@ if __name__ == "__main__":
                         help='img save name',
                         default='test')
     # parser.add_argument('--start_frame', type=int, default=0)
+    parser.add_argument('--use_static_cam', action='store_true', default=False)
     parser.add_argument('--force_step', type=int, default=3)
     parser.add_argument('--force_interval', type=int, default=120)
     parser.add_argument('--force_num', type=int, default=3)
@@ -1112,19 +1276,32 @@ if __name__ == "__main__":
     parser.add_argument('--render_engine', type=str, default='CYCLES', choices=['BLENDER_EEVEE', 'CYCLES'])
     parser.add_argument('--add_smoke', action='store_true', default=False)
     parser.add_argument('--views', default=1, type=int)
+    parser.add_argument('--max_frames', type=int, default=None,
+                        help='Maximum number of frames to render (default: render all)')
+    parser.add_argument('--seed', type=int, default=None)
+
     args = parser.parse_args(argv)
     print("args:{0}".format(args))
+
+    # generate the seed if none was provided
+    if args.seed is not None:
+        seed = args.seed
+    else:
+        seed = (int(time.time() * 1e6) + os.getpid()) % (2**32)
+
+    print(f"seed: {seed}")
+    np.random.seed(seed)
 
     ## Load the world
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
     renderer = Blender_render(scratch_dir=output_dir, render_engine=args.render_engine, use_gpu=args.use_gpu, material_path=args.material_path,
-                              animal_path=args.animal_root, animal_name=args.animal_name,
+                              animal_path=args.animal_root, animal_texture_path=args.animal_texture_root, animal_name=args.animal_name,
                               camera_path=args.camera_root, background_hdr_path=args.background_hdr_path, GSO_path=args.gso_root, num_assets=args.num_assets,
-                              custom_scene=args.scene_root, use_indoor_cam=args.indoor, partnet_path=args.partnet_root,
+                              custom_scene=args.scene_root, use_indoor_cam=args.indoor, use_static_cam = args.use_static_cam, partnet_path=args.partnet_root,
                               add_force=args.add_force, force_step=args.force_step, force_interval=args.force_interval, force_num=args.force_num,
-                              add_smoke=args.add_smoke, views=args.views)
+                              add_smoke=args.add_smoke, views=args.views, max_frames=args.max_frames)
 
     renderer.render()
 

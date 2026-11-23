@@ -1,3 +1,21 @@
+''' 
+# Copyright 2024 The Kubric Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+Modifications made by the PointOdyssey Authors (https://github.com/y-zheng18/point_odyssey/tree/main).
+'''
+
 import json
 
 import Imath
@@ -190,7 +208,8 @@ def postprocess(
       return_layers: Sequence[str],
       batch_size: int,
       output_dir: str,
-      frame_idx: int):
+      frame_idx: int, 
+      scene_root = None):
     post_processors = {
         "backward_flow": process_backward_flow,
         "forward_flow": process_forward_flow,
@@ -210,7 +229,8 @@ def postprocess(
     exr_frames = sorted((from_dir / "exr").glob("*.exr"))[frame_idx:]
     png_frames = [from_dir / "images" / (exr_filename.stem + ".png")
                   for exr_filename in exr_frames]
-    scene_info = json.load(open(from_dir / 'scene_info.json', 'r'))
+    scene_info_path = epath.Path(scene_root) / 'scene_info.json' if scene_root else from_dir / 'scene_info.json'
+    scene_info = json.load(open(scene_info_path, 'r'))
     scene_info['assets'] += ['Plane']
     #scene_info['assets'] = ['background'] + [i for i in scene_info['assets'] if 'robot' in i or 'Rock' in i or 'Cube' in i] # + ['Sphere'] # The last one is the background
 
@@ -259,6 +279,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, metavar='PATH',
                         default='/Users/yangzheng/code/project/renderer/results/robot/exr_img',
                         help='img save dir')
+    parser.add_argument('--scene_root', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--frame_idx', type=int, default=0)
     args = parser.parse_args()
@@ -271,6 +292,7 @@ if __name__ == '__main__':
                                  "normal", # "object_coordinates",
                                  "segmentation"), batch_size=args.batch_size,
                                   output_dir=args.output_dir,
-                              frame_idx=args.frame_idx)
+                                  frame_idx=args.frame_idx,
+                                  scene_root=args.scene_root)
 
     # write_image_dict(frames_dict, args.output_dir)

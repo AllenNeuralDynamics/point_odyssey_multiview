@@ -11,13 +11,16 @@ import sys
 import glob
 import json
 
+import addon_utils
+
 FOCAL_LENGTH = 30
 SENSOR_WIDTH = 50
 RESULOUTION_X = 960
 RESULOUTION_Y = 540
 
 # randomize np seed using time
-np.random.seed(int(time.time()))
+# np.random.seed(int(time.time()))
+np.random.seed((int(time.time() * 1e6) + os.getpid()) % (2**32))
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 class Blender_render():
@@ -29,6 +32,7 @@ class Blender_render():
                  use_character=None,
                  motion_path=None,
                  camera_path=None,
+                 motion_dataset=None,
                  render_engine='BLENDER_EEVEE',
                  adaptive_sampling=False,
                  use_denoising=True,
@@ -38,11 +42,13 @@ class Blender_render():
                  custom_scene=None,
                  use_gpu: bool = False,
                  use_indoor_cam: bool = False,
+                 use_static_cam: bool = False,
                  add_force: bool = False,
                  force_step: int = 3,
                  force_num: int = 3,
                  force_interval: int = 200,
                  views: int = 1,
+                 max_frames = None
                  ):
         self.blender_scene = bpy.context.scene
         self.render_engine = render_engine
@@ -61,7 +67,12 @@ class Blender_render():
         self.motion_path = motion_path
         self.GSO_path = GSO_path
         self.camera_path = camera_path
-        self.motion_dataset = ['CMU'] # ['TotalCapture', 'DanceDB', 'CMU', 'MoSh', 'SFU']
+        self.use_static_cam = use_static_cam
+
+        # motion_datasets = ['TotalCapture', 'DanceDB', 'CMU', 'KIT', 'GRAB', 'Transitions_mocap', 'Eyes_Japan_Dataset', 
+        #                    'ACCAD', 'BioMotionLab_NTroje', 'BMLhandball', 'BMLmovi', 'MPI_HDM05']
+        motion_datasets = [p for p in os.listdir(self.motion_path) if not p.startswith('.')]
+        self.motion_dataset = motion_dataset if motion_dataset is not None else motion_datasets
         self.motion_speed = {'TotalCapture': 1 / 1.5, 'DanceDB': 1.0, 'CMU': 1.0, 'MoSh': 1.0 / 1.2, 'SFU': 1.0 / 1.2}
 
         self.force_step = force_step
@@ -74,6 +85,22 @@ class Blender_render():
         assert custom_scene is not None
         print("Loading scene from '%s'" % custom_scene)
         bpy.ops.wm.open_mainfile(filepath=custom_scene)
+
+        # Re-enable required addons after scene change
+        # (opening a new scene file unloads addon-registered scene properties)
+        for addon_name in ['rokoko-studio-live-blender', 'smplx_blender_addon', 'stop_motion_obj']:
+            try:
+                addon_utils.enable(addon_name, default_set=True, persistent=True)
+            except Exception as e:
+                print(f"Warning: could not enable addon {addon_name}: {e}")
+
+        # Sanity check that Rokoko's retargeting is actually available
+        if not hasattr(bpy.context.scene, 'rsl_retargeting_armature_source'):
+            raise RuntimeError(
+                "Rokoko retargeting unavailable after re-enable. "
+                "Available rsl_* attrs: " + 
+                str([a for a in dir(bpy.context.scene) if 'rsl' in a.lower()])
+            )
 
         self.obj_set = set(bpy.context.scene.objects)
         self.assets_set = []
@@ -89,6 +116,7 @@ class Blender_render():
         self.exr_output_node = self.set_up_exr_output_node()
 
         self.views = views
+        self.max_frames = max_frames
 
         # self.blender_scene.render.resolution_percentage = 100
         if background_hdr_path:
@@ -120,7 +148,9 @@ class Blender_render():
 
             bpy.context.preferences.addons["cycles"].preferences.get_devices()
             for d in bpy.context.preferences.addons["cycles"].preferences.devices:
-                d.use = True
+                # GPU-only: enable CUDA GPU devices, disable the CPU device so
+                # Cycles doesn't hybrid-render on CPU (which oversubscribes cores).
+                d.use = (d.type == 'CUDA')
                 print("Device '{}' type {} : {}".format(d.name, d.type, d.use))
             print('setting up gpu done')
             print("----------------------------------------------")
@@ -228,13 +258,51 @@ class Blender_render():
         character_list = [c for c in character_list if os.path.isdir(os.path.join(self.character_path, c))]
         character = np.random.choice(character_list) if self.use_character is None else self.use_character
         self.character_name = character
-        character_collection_path = os.path.join(self.character_path, character, '{}.blend'.format(character),
-                                                 'Collection')
 
-        bpy.ops.wm.append(directory=character_collection_path, filename=character)
-        character_collection = bpy.data.collections[character]
+
+        # character_collection_path = os.path.join(self.character_path, character, '{}.blend'.format(character),
+        #                                          'Collection')
+
+        # bpy.ops.wm.append(directory=character_collection_path, filename=character)
+        # character_collection = bpy.data.collections[character]
+        # self.character = character_collection
+        # self.skeleton = bpy.data.objects['skeleton_' + character]
+
+
+        character_collection_path = os.path.join(self.character_path, character, '{}.blend'.format(character),
+                                                'Collection')
+
+        # Snapshot what exists before appending so we can find what gets added
+        existing_collections = set(bpy.data.collections.keys())
+        existing_objects = set(bpy.data.objects.keys())
+
+        # In this asset library, the collection is named 'Collection' (Blender's default)
+        # rather than the character name. Use 'Collection' as the filename.
+        bpy.ops.wm.append(directory=character_collection_path, filename='Collection')
+
+        # Find what was added by the append
+        new_collections = set(bpy.data.collections.keys()) - existing_collections
+        new_objects = set(bpy.data.objects.keys()) - existing_objects
+
+        if not new_collections:
+            raise RuntimeError(f"Failed to append collection from {character_collection_path}")
+
+        # Use the actual collection name (might be 'Collection' or have a numeric suffix like 'Collection.001')
+        actual_collection_name = next(iter(new_collections))
+        character_collection = bpy.data.collections[actual_collection_name]
         self.character = character_collection
-        self.skeleton = bpy.data.objects['skeleton_' + character]
+
+        # Find the armature among the newly-added objects (was: 'skeleton_' + character)
+        armature = None
+        for obj_name in new_objects:
+            if bpy.data.objects[obj_name].type == 'ARMATURE':
+                armature = bpy.data.objects[obj_name]
+                break
+        if armature is None:
+            raise RuntimeError(f"No armature found in appended collection from {character_collection_path}")
+        self.skeleton = armature
+
+        ### 
 
         bone_mapping_path = os.path.join(self.character_path, character, 'bone_mapping.json')
         bone_mapping = json.load(open(bone_mapping_path, 'r'))
@@ -266,7 +334,7 @@ class Blender_render():
 
         partnet_assets = os.listdir(self.partnet_path)
         partnet_assets = [os.path.join(self.partnet_path, asset) for asset in partnet_assets]
-        partnet_assets = [asset for asset in partnet_assets if os.path.isdir(asset) and len(os.listdir(os.path.join(asset, 'objs'))) < 15]
+        partnet_assets = [asset for asset in partnet_assets if os.path.isdir(asset) and not os.path.basename(asset).startswith('.') and len(os.listdir(os.path.join(asset, 'objs'))) < 15]
         partnet_assets = np.random.choice(partnet_assets, size=self.num_assets - len(GSO_assets_path), replace=False)
 
         # generating location lists for assets, and remove the center area
@@ -440,6 +508,25 @@ class Blender_render():
         obj.data.materials.append(mat)
 
     def set_up_exr_output_node(self):
+        ''' 
+        # This function is derived from Kubric. 
+        
+        # Copyright 2024 The Kubric Authors.
+        #
+        # Licensed under the Apache License, Version 2.0 (the "License");
+        # you may not use this file except in compliance with the License.
+        # You may obtain a copy of the License at
+        #
+        #     http://www.apache.org/licenses/LICENSE-2.0
+        #
+        # Unless required by applicable law or agreed to in writing, software
+        # distributed under the License is distributed on an "AS IS" BASIS,
+        # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        # See the License for the specific language governing permissions and
+        # limitations under the License.
+
+        Modifications made by the PointOdyssey Authors (https://github.com/y-zheng18/point_odyssey/tree/main).
+        '''
         bpy.context.scene.use_nodes = True
         tree = bpy.context.scene.node_tree
         links = tree.links
@@ -507,7 +594,7 @@ class Blender_render():
         motion_files = glob.glob(os.path.join(self.motion_path, motion_dataset, '**/*.npz'), recursive=True)
         motion_files = [f for f in motion_files]
         # filter out too small motion
-        motion_files = [f for f in motion_files if os.path.getsize(f) > 1e7]
+        motion_files = [f for f in motion_files if os.path.getsize(f) > 3e6] # 3 MB
         motion = np.random.choice(motion_files)
         print('loading motion {}'.format(motion))
 
@@ -517,12 +604,11 @@ class Blender_render():
         smplx_skeleton = smplx.parent
 
         # slow down the motion
-        speed_scale = self.motion_speed[motion_dataset]
+        speed_scale = self.motion_speed.get(motion_dataset, 1.0)
         bpy.context.scene.frame_end = int(bpy.context.scene.frame_end / speed_scale)
         for fcurve in smplx_skeleton.animation_data.action.fcurves:
             for keyframe in fcurve.keyframe_points:
                 keyframe.co[0] = keyframe.co[0] / speed_scale
-
 
         bpy.context.scene.rsl_retargeting_armature_source = smplx_skeleton
         bpy.context.scene.rsl_retargeting_armature_target = self.skeleton
@@ -712,11 +798,17 @@ class Blender_render():
             delta_T *= self.scale_factor
             print('delta_T', delta_T)
             # delta_T = np.clip(delta_T, -0.2 * 1 / time_ratio * self.scale_factor, 0.2 * 1 / time_ratio * self.scale_factor).reshape(3)
-            mean_location = np.mean([obj.matrix_world.translation for obj in self.assets_set if
-                                     np.max(np.abs(obj.matrix_world.translation)) < 3 * self.scale_factor], axis=0)
-
-            # mean_location[:2] *= 0
-            self.cam_lookat = self.cam_lookat * 0.95 + mathutils.Vector(mean_location) * 0.05
+            near_assets = [obj.matrix_world.translation for obj in self.assets_set
+                           if np.max(np.abs(obj.matrix_world.translation)) < 3 * self.scale_factor]
+            # When forces fling every asset out of range this frame, the list is
+            # empty and np.mean([], axis=0) returns a nan scalar, which makes
+            # mathutils.Vector() raise TypeError and aborts the whole render
+            # before any frame is written. In that case keep the previous
+            # look-at target instead of crashing.
+            if near_assets:
+                mean_location = np.mean(near_assets, axis=0)
+                # mean_location[:2] *= 0
+                self.cam_lookat = self.cam_lookat * 0.95 + mathutils.Vector(mean_location) * 0.05
 
             self.cam_loc = self.cam_loc + mathutils.Vector([delta_T[0], delta_T[1], delta_T[2]])
             if np.linalg.norm(np.array(self.cam_loc[:2])) < initial_r * 0.75:
@@ -748,7 +840,10 @@ class Blender_render():
 
         absolute_path = os.path.abspath(self.scratch_dir)
 
-        frames = range(bpy.context.scene.frame_start, bpy.context.scene.frame_end + 1)
+        frame_end = (bpy.context.scene.frame_start + self.max_frames - 1
+             if self.max_frames is not None
+             else bpy.context.scene.frame_end)
+        frames = range(bpy.context.scene.frame_start, frame_end + 1)
 
         # add forces
         for frame_nr in frames:
@@ -798,6 +893,8 @@ class Blender_render():
                       'assets': ['background']}
         scene_info['assets'] += [x.data.name for x in self.assets_set]
         scene_info['character'] = self.character_name
+        scene_info['character_meshes'] = [obj.data.name for obj in self.character.objects 
+                                         if not obj.hide_render and obj.type == 'MESH']
         json.dump(scene_info, open(os.path.join(self.scratch_dir, 'scene_info.json'), 'w'))
 
         use_multiview = self.views > 1
@@ -810,14 +907,15 @@ class Blender_render():
             obj_save_dir = os.path.join(self.scratch_dir, 'obj')
             os.makedirs(camera_save_dir, exist_ok=True)
             os.makedirs(obj_save_dir, exist_ok=True)
-            # set camera poses from real camera trajectory
-            camera_files = glob.glob(os.path.join(self.camera_path, '*/*.txt'))
-            # filter out small files
-            camera_files = [c for c in camera_files if os.path.getsize(c) > 5000]
-            camera_file = np.random.choice(camera_files)
-            print('camera file: ', camera_file)
-            camera_rt = np.loadtxt(camera_file, skiprows=1)[:, 7:].reshape(-1, 3, 4)
-            self.bake_camera(camera_rt, frames)
+
+            if not self.use_static_cam:
+                # set camera poses from real camera trajectory
+                camera_files = glob.glob(os.path.join(self.camera_path, '*/*.txt'))
+                camera_files = [c for c in camera_files if os.path.getsize(c) > 5000]
+                camera_file = np.random.choice(camera_files)
+                print('camera file: ', camera_file)
+                camera_rt = np.loadtxt(camera_file, skiprows=1)[:, 7:].reshape(-1, 3, 4)
+                self.bake_camera(camera_rt, frames)
 
             bpy.ops.wm.save_as_mainfile(filepath=os.path.join(absolute_path, 'scene.blend'))
             for frame_nr in frames:
@@ -835,12 +933,14 @@ class Blender_render():
                 np.savetxt(os.path.join(camera_save_dir, f"K_{frame_nr:04d}.txt"), K)
                 print("Rendered frame '%s'" % bpy.context.scene.render.filepath)
         else:
-            # set camera poses from real camera trajectory
-            camera_files = glob.glob(os.path.join(self.camera_path, '*/*.txt'))
-            # filter out small files
-            camera_files = [c for c in camera_files if os.path.getsize(c) > 5000]
-            camera_files = np.random.choice(camera_files, self.views, replace=False)
-            print('camera files: ', camera_files)
+
+            if not self.use_static_cam: 
+                # set camera poses from real camera trajectory
+                camera_files = glob.glob(os.path.join(self.camera_path, '*/*.txt'))
+                # filter out small files
+                camera_files = [c for c in camera_files if os.path.getsize(c) > 5000]
+                camera_files = np.random.choice(camera_files, self.views, replace=False)
+                print('camera files: ', camera_files)
 
             self.camera_list = []
             for i in range(self.views):
@@ -861,9 +961,10 @@ class Blender_render():
                 self.camera.data.clip_end = 10000
                 self.camera.data.sensor_width = SENSOR_WIDTH
 
-                camera_file = camera_files[i]
-                camera_rt = np.loadtxt(camera_file, skiprows=1)[:, 7:].reshape(-1, 3, 4)
-                self.bake_camera(camera_rt, frames)
+                if not self.use_static_cam:
+                    camera_file = camera_files[i]
+                    camera_rt = np.loadtxt(camera_file, skiprows=1)[:, 7:].reshape(-1, 3, 4)
+                    self.bake_camera(camera_rt, frames)
 
             bpy.ops.wm.save_as_mainfile(filepath=os.path.join(absolute_path, 'scene.blend'))
             for frame_nr in frames:
@@ -968,6 +1069,7 @@ if __name__ == "__main__":
                         help='img save name',
                         default='test')
     # parser.add_argument('--start_frame', type=int, default=0)
+    parser.add_argument('--use_static_cam', action='store_true', default=False)
     parser.add_argument('--force_step', type=int, default=3)
     parser.add_argument('--force_interval', type=int, default=120)
     parser.add_argument('--force_num', type=int, default=3)
@@ -976,9 +1078,21 @@ if __name__ == "__main__":
     parser.add_argument('--use_gpu', action='store_true', default=False)
     parser.add_argument('--indoor', action='store_true', default=False)
     parser.add_argument('--views', type=int, default=1)
+    parser.add_argument('--max_frames', type=int, default=None,
+                        help='Maximum number of frames to render (default: render all)')
+    parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--render_engine', type=str, default='CYCLES', choices=['BLENDER_EEVEE', 'CYCLES'])
     args = parser.parse_args(argv)
     print("args:{0}".format(args))
+
+    # generate the seed if none was provided
+    if args.seed is not None:
+        seed = args.seed
+    else:
+        seed = (int(time.time() * 1e6) + os.getpid()) % (2**32)
+
+    print(f"seed: {seed}")
+    np.random.seed(seed)
 
     ## Load the world
     output_dir = args.output_dir
@@ -986,9 +1100,9 @@ if __name__ == "__main__":
 
     renderer = Blender_render(scratch_dir=output_dir, render_engine=args.render_engine, use_gpu=args.use_gpu, character_path=args.character_root, motion_path=args.motion_root,
                               camera_path=args.camera_root, background_hdr_path=args.background_hdr_path, GSO_path=args.gso_root, num_assets=args.num_assets,
-                              custom_scene=args.scene_root, use_indoor_cam=args.indoor, partnet_path=args.partnet_root, use_character=args.use_character,
+                              custom_scene=args.scene_root, use_indoor_cam=args.indoor, use_static_cam = args.use_static_cam, partnet_path=args.partnet_root, use_character=args.use_character,
                               add_force=args.add_force, force_step=args.force_step, force_interval=args.force_interval, force_num=args.force_num,
-                              views=args.views)
+                              views=args.views, max_frames=args.max_frames)
 
     renderer.render()
 
